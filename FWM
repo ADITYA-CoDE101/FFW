@@ -1,0 +1,457 @@
+#!/usr/bin/env python3
+"""Interactive PDF watermark detector and remover.
+
+Prompts for a PDF path, scans for watermarks (text, image, vector,
+annotation), reports findings, and removes them with confirmation.
+"""
+
+import sys, os, re
+from collections import Counter, defaultdict
+
+try:
+    import fitz
+except ImportError:
+    print("Install PyMuPDF: pip install PyMuPDF", file=sys.stderr)
+    sys.exit(1)
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+def _all_spans(page):
+    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+    spans = []
+    for b in blocks:
+        if b["type"] != 0:
+            continue
+        for line in b.get("lines", []):
+            for s in line.get("spans", []):
+                t = s["text"].strip()
+                if t:
+                    spans.append(dict(
+                        text=t,
+                        bbox=s["bbox"],
+                        font=s["font"],
+                        size=round(s["size"], 1),
+                        color=s.get("color"),
+                        page_num=page.number,
+                    ))
+    return spans
+
+
+def _redact_text(page, bbox):
+    clip = fitz.Rect(bbox).irect
+    page.add_redact_annot(clip, fill=(1, 1, 1))
+    page.apply_redactions()
+
+
+# ── Scanner ────────────────────────────────────────────────────────────────
+
+def scan_text_repeated(doc):
+    """Find text that appears at the same position on many pages."""
+    n = len(doc)
+    if n < 2:
+        return []
+    threshold = max(2, int(n * 0.7))
+    all_spans = []
+    for i in range(n):
+        all_spans.extend(_all_spans(doc[i]))
+    groups = Counter()
+    for s in all_spans:
+        b = s["bbox"]
+        key = (s["text"], s["font"], s["size"],
+               round(b[0], -1), round(b[1], -1),
+               round(b[2], -1), round(b[3], -1))
+        groups[key] += 1
+    findings = []
+    for key, count in groups.most_common(30):
+        if count >= threshold:
+            text = key[0]
+            findings.append(dict(type="text_repeated", text=text,
+                                 count=count, pages=threshold, detail=key))
+    return findings
+
+
+def _is_grey(c):
+    """True if colour is mid-grey (R≈G≈B, not black/white)."""
+    if not isinstance(c, (list, tuple)) or len(c) < 3:
+        return False
+    r, g, bl = c[0], c[1], c[2]
+    return (0.15 < r < 0.85 and 0.15 < g < 0.85 and 0.15 < bl < 0.85 and
+            abs(r - g) < 0.12 and abs(g - bl) < 0.12)
+
+
+def _has_alpha(c):
+    """True if colour tuple has alpha/opacity < 1."""
+    if isinstance(c, (list, tuple)) and len(c) >= 4:
+        return c[3] < 0.95
+    return False
+
+
+def scan_text_single(doc):
+    """Find text that looks like a watermark on individual pages.
+    
+    Heuristics: semi-transparent text, mid-grey text, large+centred text
+    that doesn't look like a title."""
+    n = len(doc)
+    findings = []
+    for i in range(n):
+        page = doc[i]
+        spans = _all_spans(page)
+        if not spans:
+            continue
+
+        # Group spans on this page to understand context
+        sizes = sorted([s["size"] for s in spans])
+        if not sizes:
+            continue
+        median_size = sizes[len(sizes) // 2]
+
+        for s in spans:
+            flags = []
+            score = 0
+            c = s.get("color")
+
+            # Semi-transparent text — strong watermark indicator
+            if _has_alpha(c):
+                flags.append("semi-transparent")
+                score += 3
+
+            # Grey text — common for watermarks
+            if _is_grey(c):
+                flags.append(f"grey")
+                score += 2
+
+            # Very large text positioned at centre (potential watermark)
+            pw, ph = page.rect.width, page.rect.height
+            bx0, by0, bx1, by1 = s["bbox"]
+            cx = (bx0 + bx1) / 2
+            cy = (by0 + by1) / 2
+            centre_dist = abs(cx - pw / 2) / pw
+
+            # Large + centred is a strong watermark signal
+            if s["size"] > median_size * 2 and s["size"] >= 15:
+                if centre_dist < 0.20:
+                    flags.append(f"large+centred ({s['size']}pt)")
+                    score += 2
+                else:
+                    # Might be a heading — score lower
+                    flags.append(f"large ({s['size']}pt)")
+                    score += 1
+
+            # Diagonal/rotated text in content stream can't be detected
+            # from text spans; that's handled by vector scanner.
+
+            # Tiny footer-type text at very bottom edge
+            if by1 > ph * 0.92 and s["size"] < 8:
+                flags.append("tiny-footer")
+                score += 1
+
+            if score >= 2:
+                findings.append(dict(type="text_watermark",
+                                     text=s["text"][:80],
+                                     page=i + 1,
+                                     score=score,
+                                     flags=flags,
+                                     bbox=s["bbox"]))
+
+    # Deduplicate same text on same page
+    seen = set()
+    unique = []
+    for f in findings:
+        dedup_key = (f["page"], f["text"])
+        if dedup_key not in seen:
+            seen.add(dedup_key)
+            unique.append(f)
+    return unique
+
+
+def scan_images_repeated(doc):
+    """Find images that appear at the same position on many pages."""
+    n = len(doc)
+    if n < 2:
+        return []
+    threshold = max(2, int(n * 0.7))
+    img_positions = defaultdict(list)
+    for i in range(n):
+        page = doc[i]
+        for inst in page.get_image_info():
+            bbox = inst["bbox"]
+            if not bbox:
+                continue
+            key = (round(bbox[0], -1), round(bbox[1], -1),
+                   round(bbox[2], -1), round(bbox[3], -1))
+            img_positions[key].append(i + 1)
+    findings = []
+    for key, pages in img_positions.items():
+        if len(pages) >= threshold:
+            w = round(key[2] - key[0], 1)
+            h = round(key[3] - key[1], 1)
+            findings.append(dict(type="image_repeated", bbox=key,
+                                 count=len(pages), dimensions=f"{w}x{h}"))
+    return findings
+
+
+def scan_vector(doc):
+    """Find vector paths drawn with semi-transparent graphics state."""
+    # Collect ExtGState objects with /ca (fill alpha) < 1
+    gs_objects = {}
+    for i in range(1, doc.xref_length()):
+        try:
+            obj = doc.xref_object(i)
+            if "/ca" in obj:
+                m = re.search(r"/ca\s+([\d.]+)", obj)
+                if m:
+                    ca = float(m.group(1))
+                    if ca < 0.99:
+                        gs_objects[f"GState{i}"] = ca
+        except (ValueError, TypeError):
+            pass
+
+    if not gs_objects:
+        return []
+
+    # Check each page for usage of these GS names
+    findings = []
+    for pnum in range(len(doc)):
+        page = doc[pnum]
+        try:
+            raw = page.read_contents().decode("latin-1")
+        except:
+            continue
+        for gs_name, opacity in gs_objects.items():
+            if f"/{gs_name} gs" in raw:
+                count = raw.count(f"/{gs_name} gs")
+                findings.append(dict(type="vector_path", gs=gs_name,
+                                     opacity=round(opacity, 2),
+                                     page=pnum + 1, occurrences=count))
+    # De-duplicate
+    seen = set()
+    unique = []
+    for f in findings:
+        k = (f["gs"], f["page"])
+        if k not in seen:
+            seen.add(k)
+            unique.append(f)
+    return unique
+
+
+def scan_annotations(doc):
+    """Count annotations per page."""
+    findings = []
+    for i in range(len(doc)):
+        page = doc[i]
+        annots = list(page.annots() or [])
+        if annots:
+            subtypes = Counter(a.type for a in annots)
+            findings.append(dict(type="annotation", page=i + 1,
+                                 count=len(annots),
+                                 subtypes=[f"{s[0]} ({s[1]})" for s in subtypes.most_common(5)]))
+    return findings
+
+
+def scan_all(doc):
+    results = []
+    results.extend(scan_text_repeated(doc))
+    results.extend(scan_text_single(doc))
+    results.extend(scan_images_repeated(doc))
+    results.extend(scan_vector(doc))
+    results.extend(scan_annotations(doc))
+    return results
+
+
+# ── Removers ───────────────────────────────────────────────────────────────
+
+def remove_text_repeated(doc, finding):
+    text = finding["text"]
+    for i in range(len(doc)):
+        for s in _all_spans(doc[i]):
+            if s["text"] == text:
+                _redact_text(doc[i], s["bbox"])
+
+
+def remove_text_watermark(doc, finding):
+    page = doc[finding["page"] - 1]
+    _redact_text(page, finding["bbox"])
+
+
+def remove_image_repeated(doc, finding):
+    bbox = fitz.Rect(finding["bbox"])
+    for i in range(len(doc)):
+        page = doc[i]
+        for inst in page.get_image_info():
+            r = fitz.Rect(inst["bbox"])
+            if r.intersects(bbox):
+                page.draw_rect(r, color=(1, 1, 1), fill=(1, 1, 1), overlay=True)
+
+
+def remove_vector(doc, finding):
+    gs_name = finding["gs"]
+    page = doc[finding["page"] - 1]
+    raw = page.read_contents().decode("latin-1")
+    modified = False
+
+    marker = f"/{gs_name} gs"
+    while marker in raw:
+        pos = raw.find(marker)
+        before = raw[:pos]
+        after_start = pos + len(marker)
+
+        # Find end of this transparency section
+        remaining = raw[after_start:]
+        next_gs = re.search(r'/\w+\s+gs', remaining)
+        if next_gs:
+            end_of_section = after_start + next_gs.start()
+        else:
+            end_of_section = len(raw)
+
+        section_text = raw[pos:end_of_section]
+        q_in = len(re.findall(r'\bq\b', section_text))
+        Q_in = len(re.findall(r'\bQ\b', section_text))
+        net_q = q_in - Q_in
+
+        before_text = raw[:pos]
+        after_text = raw[end_of_section:]
+
+        new_raw = before_text + '\n' + ' '.join(['Q'] * (-net_q)) + '\n' + after_text
+
+        q_new = len(re.findall(r'\bq\b', new_raw))
+        Q_new = len(re.findall(r'\bQ\b', new_raw))
+        if q_new != Q_new:
+            print(f"    Balance mismatch, skipping", file=sys.stderr)
+            break
+
+        raw = new_raw
+        modified = True
+
+    if modified:
+        page_xref = page.xref
+        page_obj = doc.xref_object(page_xref)
+        m = re.search(r"/Contents\s+(\d+)", page_obj)
+        if m:
+            xref = int(m.group(1))
+            doc.update_stream(xref, raw.encode("latin-1"))
+
+
+def remove_annotations(doc, finding):
+    page = doc[finding["page"] - 1]
+    for annot in list(page.annots() or []):
+        page.delete_annot(annot)
+
+
+REMOVERS = {
+    "text_repeated": remove_text_repeated,
+    "text_watermark": remove_text_watermark,
+    "image_repeated": remove_image_repeated,
+    "vector_path": remove_vector,
+    "annotation": remove_annotations,
+}
+
+
+# ── Display ────────────────────────────────────────────────────────────────
+
+def display_findings(findings):
+    if not findings:
+        print("\n  No watermarks detected.")
+        return
+    print(f"\n  Found {len(findings)} potential watermark(s):\n")
+    for idx, f in enumerate(findings, 1):
+        t = f["type"]
+        if t == "text_repeated":
+            print(f"  [{idx}] TEXT (repeated)  \"{f['text']}\"  —  {f['count']} pages")
+        elif t == "text_watermark":
+            print(f"  [{idx}] TEXT (maybe)     pg {f['page']:>3}  \"{f['text']}\"")
+            for flag in f["flags"]:
+                print(f"       → {flag}")
+        elif t == "image_repeated":
+            print(f"  [{idx}] IMAGE (repeated)  {f['dimensions']}  —  {f['count']} pages")
+        elif t == "vector_path":
+            print(f"  [{idx}] VECTOR PATH       pg {f['page']:>3}  "
+                  f"opacity={f['opacity']}  ({f['occurrences']} use(s))")
+        elif t == "annotation":
+            subs = ", ".join(f["subtypes"][:3])
+            print(f"  [{idx}] ANNOTATION        pg {f['page']:>3}  "
+                  f"{f['count']} annot(s)  [{subs}]")
+
+
+def interactive_select(findings):
+    """Ask user which findings to remove."""
+    display_findings(findings)
+    if not findings:
+        return []
+    print("\n  Enter numbers to remove (e.g. 1 3 5), 'all', or 'none':")
+    choice = input("  > ").strip().lower()
+    if choice == "all":
+        return list(range(len(findings)))
+    if choice == "none" or not choice:
+        return []
+    indices = []
+    for part in choice.split():
+        try:
+            idx = int(part) - 1
+            if 0 <= idx < len(findings):
+                indices.append(idx)
+        except ValueError:
+            pass
+    return indices
+
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+def main():
+    print("=" * 60)
+    print("  PDF Watermark Detector & Remover")
+    print("=" * 60)
+
+    # Ask for PDF path
+    while True:
+        path = input("\nEnter PDF path: ").strip().strip('"').strip("'")
+        if not path:
+            print("No path entered.")
+            return
+        path = os.path.expanduser(path)
+        if os.path.isfile(path):
+            break
+        print(f"  File not found: {path}")
+
+    print(f"\nOpening {path} ...")
+    doc = fitz.open(path)
+    np = len(doc)
+    print(f"  {np} page(s), {doc.xref_length()} PDF objects\n")
+
+    # Scan
+    print("Scanning for watermarks...")
+    findings = scan_all(doc)
+    doc.close()  # close after scan, re-open for removal
+
+    if not findings:
+        print("\n  No watermarks detected.")
+        print("  If you know the watermark text, re-run and use --text \"DRAFT\"")
+        return
+
+    # Interactive selection
+    indices = interactive_select(findings)
+    if not indices:
+        print("\nNo watermarks selected for removal. Exiting.")
+        return
+
+    # Re-open and remove
+    print(f"\nRemoving {len(indices)} watermark(s)...")
+    doc = fitz.open(path)
+    for idx in indices:
+        f = findings[idx]
+        t = f["type"]
+        remover = REMOVERS.get(t)
+        if remover:
+            remover(doc, f)
+            print(f"  ✓ Removed [{idx + 1}] ({t})", file=sys.stderr)
+
+    # Determine output path
+    base, ext = os.path.splitext(path)
+    out = base + "_CLEAN" + ext
+    doc.save(out, garbage=4, deflate=True, clean=True)
+    doc.close()
+    print(f"\nDone! Clean PDF saved to: {out}")
+
+
+if __name__ == "__main__":
+    main()
